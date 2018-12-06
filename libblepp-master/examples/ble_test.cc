@@ -29,8 +29,10 @@
 #include <deque>
 #include <sys/time.h>
 #include <unistd.h>
+#include <pthread.h>
 #include "cxxgplot.h"  //lolzworthy plotting program
 #include "blepp/csv_class.h"
+#include "blepp/msg_queue.h"
 
 using namespace std;
 using namespace BLEPP;
@@ -39,6 +41,12 @@ using namespace BLEPP;
 #define ANGLE_SER 	UUID("8efc0000-6ee9-4c70-8615-3456c364d7e6")
 #define ROLL_CHAR 	UUID("8efc0001-6ee9-4c70-8615-3456c364d7e6")
 #define PITCH_CHAR 	UUID("8efc0002-6ee9-4c70-8615-3456c364d7e6")
+
+//Define message queue
+MsgQueue log_queue(1000);
+
+//Log file
+std::string log_file_name = "csv_file.csv";
 
 void bin(uint8_t i)
 {
@@ -80,11 +88,117 @@ int convert_16bit_value(const uint8_t * d)
 	return val - 90;
 }
 
-void add_to_readings(deque<int>* values, int val	)
+void add_to_readings(deque<int>* values, int val)
 {
 	values->push_back(val);
 	if(values->size() > 300)
 		values->pop_front();
+}
+
+
+//Thread function for logging value to csv file
+void* log_to_csv(void* _arg) {
+
+	//CSV file for logging
+	csv_class csv(log_file_name,",");
+	
+	PROCESS_ID pID = *(PROCESS_ID*)_arg;	//(int*) casts the void pointer to an integer pointer, the '*' then returns the value of the integer pointer.
+
+	std::string string_senderID;
+	std::string string_value;
+	std::string string_time;
+
+	Message recvMsg;
+
+	EVENT_ID eventID;
+	PROCESS_ID senderID;
+	int value;
+	double time;
+	
+	std::cout << "Thread " << pID << " running" << std::endl;
+
+
+	while(1)
+	{
+	recvMsg = log_queue.receive();
+	eventID = recvMsg.eventID_;
+	senderID = recvMsg.senderID_;
+	value = recvMsg.val;
+	time = recvMsg.time;
+	
+		if(eventID == NEW_NOTIFICATION)
+		{
+			std::vector<std::string> data_line;
+			
+			//Write senderID and value as line to csv file
+			string_senderID = to_string(senderID);
+			string_value = to_string(value);
+			string_time = to_string(time);
+		
+			data_line.push_back(string_senderID);
+			data_line.push_back(string_time);
+			data_line.push_back(string_value);
+			
+			if(csv.write_csv(&data_line))
+			{
+				std::cout << "Error writing to csv file" << std::endl;
+			}
+
+			std::cout << "New msq from char " << senderID << " with value " << value << std::endl;
+
+		}
+	}
+
+}
+
+//Thread function for plotting value
+void* plot_val(void* _arg) 
+{
+
+	//This is a cheap and cheerful plotting system using gnuplot.
+	//Ignore this if you don't care about plotting.
+	cplot::Plotter plot;
+	plot.range = " [ ] [:] ";
+	
+	
+	PROCESS_ID pID = *(PROCESS_ID*)_arg;	//(int*) casts the void pointer to an integer pointer, the '*' then returns the value of the integer pointer.
+
+	Message recvMsg;
+
+	EVENT_ID eventID;
+	PROCESS_ID senderID;
+	int value;
+	double time;
+	
+	deque<int> values_deq;
+	
+	std::cout << "Thread " << pID << " running" << std::endl;
+
+	while(1)
+	{
+	recvMsg = log_queue.receive();
+	eventID = recvMsg.eventID_;
+	senderID = recvMsg.senderID_;
+	value = recvMsg.val;
+	time = recvMsg.time;
+	
+		if(eventID == NEW_NOTIFICATION)
+		{
+			add_to_readings(&values_deq, value);
+			
+			plot.newline("line lw 3 lt 1 title \"\"");
+			plot.addpts(values_deq);
+			ostringstream os;
+			//os << "set title \"Angle: " << 1 << " Number of values: " << count << "\"";
+			plot.add_extra(os.str());
+
+			plot.draw();
+
+			std::cout << "New msq from char " << senderID << " with value " << value << std::endl;
+
+		}
+	}
+
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -102,9 +216,6 @@ int main(int argc, char **argv)
 	}
 
 	log_level = Info;
-	
-	//CSV file for logging
-	csv_class csv("csv_file.csv",",");
 
 	
 	//This is the interface to the BLW protocol.
@@ -114,18 +225,19 @@ int main(int argc, char **argv)
 	fd_set write_set, read_set;
 	
 
-	//This is a cheap and cheerful plotting system using gnuplot.
-	//Ignore this if you don't care about plotting.
-	cplot::Plotter plot;
-	plot.range = " [ ] [:] ";
-	deque<int> values_roll;
-	deque<int> values_pitch;
+	//deque<int> values_roll;
+	//deque<int> values_pitch;
 	
 	int count = -1;
 	double start_time = 0;
 	float voltage=0;
 	
 	//TO DO: Initialize message queue to pass messages from notification handlers to csv writer and plotter
+	
+	pthread_t log_csv_thread, plot_val_thread;
+	int tID[2] = {1, 2};
+	
+	
 	
 	//Lambda for processing write and write requests
 	std::function<void()> process_read_write = [&]() 
@@ -164,22 +276,27 @@ int main(int argc, char **argv)
 		*/			
 	std::function<void(const PDUNotificationOrIndication&)> notify_cb_roll = [&](const PDUNotificationOrIndication& n)
 	{
+		Message sentMsg;
+		
 		double t;
 		const uint8_t* d;
 		int val;
 		
 		count++;
 		
-		cout << (get_time_of_day()-start_time)  << " Seconds since first package\n";
+		t = get_time_of_day()-start_time;
+		
+		cout << t << " Seconds since first package\n";
 		
 		d = n.value().first;
 		
 		val = convert_16bit_value(d);
 				
-		add_to_readings(&values_roll, val);
+		//add_to_readings(&values_roll, val);
 		
 		cout << "Roll value: " << val << endl;
-		
+		/*
+		//Plotting function - Should be in seperate thread
 		plot.newline("line lw 3 lt 1 title \"\"");
 		plot.addpts(values_roll);
 		ostringstream os;
@@ -187,43 +304,51 @@ int main(int argc, char **argv)
 		plot.add_extra(os.str());
 
 		plot.draw();
+		//End of plotting function
+		*/
+		//Send new notification value to csv log
+		sentMsg.eventID_ = NEW_NOTIFICATION;
+		sentMsg.senderID_ = CHAR_1;
+		sentMsg.val = val;
+		sentMsg.time = t;
+		
+		log_queue.send(&sentMsg);
 		
 	};
 	
 	//Callback function for pitch notifications
 	std::function<void(const PDUNotificationOrIndication&)> notify_cb_pitch = [&](const PDUNotificationOrIndication& n)
 	{
+		Message sentMsg;
+		
 		double t;
 		const uint8_t* d;
 		int val;
-		std::vector<std::string> data_line;
-		std:string string_value;
+		//std::vector<std::string> data_line;
+		//std:string string_value;
 		
 		count++;
 		
-		cout << (get_time_of_day()-start_time)  << " Seconds since first package\n";
+		t = get_time_of_day()-start_time;
+		
+		cout << t << " Seconds since first package\n";
 		
 		d = n.value().first;
 		
 		val = convert_16bit_value(d);
 				
-		add_to_readings(&values_pitch, val);
+		//add_to_readings(&values_pitch, val);
 		
 		cout << "Pitch value: " << val << endl;
+
+		//Send new notification value to csv log
+		sentMsg.eventID_ = NEW_NOTIFICATION;
+		sentMsg.senderID_ = CHAR_2;
+		sentMsg.val = val;
+		sentMsg.time = t;
 		
-		//Log to csv file
-		csv_class csv("csv_file.csv",",");
-		
-		string_value = to_string(val);
-		
-		data_line.push_back("Pitch");
-		data_line.push_back(string_value);
-		
-		if(csv.write_csv(&data_line))
-		{
-			std::cout << "Error writing to csv file" << std::endl;
-		}
-		
+		log_queue.send(&sentMsg);
+			
 	};
 
 	//Function for subscribing to certain services and features in the BLE device
@@ -247,7 +372,7 @@ int main(int argc, char **argv)
 			for(auto& characteristic: service.characteristics) {
 				
 				
-				if(service.uuid == UUID("8efc0000-6ee9-4c70-8615-3456c364d7e6") && characteristic.uuid == UUID("8efc0001-6ee9-4c70-8615-3456c364d7e6"))
+				if(service.uuid == ANGLE_SER && characteristic.uuid == ROLL_CHAR)
 				{
 					cout << "Found and subscribed to roll characteristic\n";
 					characteristic.cb_notify_or_indicate = notify_cb_roll;
@@ -255,7 +380,7 @@ int main(int argc, char **argv)
 				
 					process_read_write();
 				}
-				else if(service.uuid == UUID("8efc0000-6ee9-4c70-8615-3456c364d7e6") && characteristic.uuid == UUID("8efc0002-6ee9-4c70-8615-3456c364d7e6"))
+				else if(service.uuid == ANGLE_SER && characteristic.uuid == PITCH_CHAR)
 				{
 					
 					cout << "Found and subscribed to pitch characteristic\n";
@@ -265,9 +390,6 @@ int main(int argc, char **argv)
 					process_read_write();
 
 				}
-
-				
-				
 
 			}
 
@@ -288,7 +410,17 @@ int main(int argc, char **argv)
 	};
 	
 	//TO DO: Start threads for writing to csv_file and plotting
+	if( 0 > pthread_create(&log_csv_thread, NULL, &log_to_csv, (void*)&tID[0]))
+	{
+		cout << "Thread creation failed" << endl;
+		exit (EXIT_FAILURE);
+	}
 
+	if( 0 > pthread_create(&plot_val_thread, NULL, &plot_val, (void*)&tID[1]))
+	{
+		cout << "Thread creation failed" << endl;
+		exit (EXIT_FAILURE);
+	}
 
 	////////////////////////////////////////////////////////////////////////////////
 	//
